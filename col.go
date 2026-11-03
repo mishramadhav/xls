@@ -5,13 +5,10 @@ import (
 	"math"
 	"strconv"
 	"strings"
-
 	"time"
-
-	yymmdd "github.com/extrame/goyymmdd"
 )
 
-//content type
+// contentHandler is the content of one cell.
 type contentHandler interface {
 	String(*WorkBook) []string
 	FirstCol() uint16
@@ -43,69 +40,92 @@ func (c *Col) String(wb *WorkBook) []string {
 	return []string{"default"}
 }
 
+// formatNo returns the number format index of XF record xf.
+func (wb *WorkBook) formatNo(xf uint16) (uint16, bool) {
+	if wb == nil || int(xf) >= len(wb.Xfs) {
+		return 0, false
+	}
+	return wb.Xfs[xf].formatNo(), true
+}
+
+// isDateFormat reports whether a custom format string shows dates or times:
+// after removing quoted text, [..] sections and escaped characters it holds a
+// d, m, y, h or s code. "General" is not a date.
+func isDateFormat(f string) bool {
+	var sb strings.Builder
+	quoted, bracket, esc := false, false, false
+	for _, r := range f {
+		switch {
+		case esc:
+			esc = false
+		case r == '\\' || r == '_' || r == '*':
+			esc = true
+		case r == '"':
+			quoted = !quoted
+		case quoted:
+		case r == '[':
+			bracket = true
+		case r == ']':
+			bracket = false
+		case !bracket:
+			sb.WriteRune(r)
+		}
+	}
+	return strings.ContainsAny(strings.ToLower(sb.String()), "dmyhs") && !strings.EqualFold(f, "general")
+}
+
+func isBuiltinDate(n uint16) bool {
+	return 14 <= n && n <= 22 || 27 <= n && n <= 36 || 45 <= n && n <= 47 || 50 <= n && n <= 58
+}
+
+// number renders a numeric cell: a date or time text when its XF has a date
+// format, else the plain decimal number without exponent.
+func (wb *WorkBook) number(xf uint16, f float64, plain string) string {
+	n, ok := wb.formatNo(xf)
+	if !ok || f < 0 || f >= 2958466 { // Excel dates end at 9999-12-31
+		return plain
+	}
+	switch {
+	case isBuiltinDate(n):
+		return timeFromExcelTime(f, wb.dateMode == 1).Format(time.RFC3339)
+	case n >= 164:
+		if fm := wb.Formats[n]; fm != nil && isDateFormat(fm.str) {
+			return formatDate(timeFromExcelTime(f, wb.dateMode == 1), fm.str)
+		}
+	}
+	return plain
+}
+
+func plainFloat(f float64) string { return strconv.FormatFloat(f, 'f', -1, 64) }
+
 type XfRk struct {
 	Index uint16
 	Rk    RK
 }
 
 func (xf *XfRk) String(wb *WorkBook) string {
-	idx := int(xf.Index)
-	if len(wb.Xfs) > idx {
-		fNo := wb.Xfs[idx].formatNo()
-		if fNo >= 164 { // user defined format
-			if formatter := wb.Formats[fNo]; formatter != nil {
-				formatterLower := strings.ToLower(formatter.str)
-				if formatterLower == "general" ||
-					strings.Contains(formatter.str, "#") ||
-					strings.Contains(formatter.str, ".00") ||
-					strings.Contains(formatterLower, "m/y") ||
-					strings.Contains(formatterLower, "d/y") ||
-					strings.Contains(formatterLower, "m.y") ||
-					strings.Contains(formatterLower, "d.y") ||
-					strings.Contains(formatterLower, "h:") ||
-					strings.Contains(formatterLower, "д.г") {
-					//If format contains # or .00 then this is a number
-					return xf.Rk.String()
-				} else {
-					i, f, isFloat := xf.Rk.number()
-					if !isFloat {
-						f = float64(i)
-					}
-					t := timeFromExcelTime(f, wb.dateMode == 1)
-					return yymmdd.Format(t, formatter.str)
-				}
-			}
-			// see http://www.openoffice.org/sc/excelfileformat.pdf Page #174
-		} else if 14 <= fNo && fNo <= 17 || fNo == 22 || 27 <= fNo && fNo <= 36 || 50 <= fNo && fNo <= 58 { // jp. date format
-			i, f, isFloat := xf.Rk.number()
-			if !isFloat {
-				f = float64(i)
-			}
-			t := timeFromExcelTime(f, wb.dateMode == 1)
-			return t.Format(time.RFC3339) //TODO it should be international
-		}
+	i, f, isFloat := xf.Rk.number()
+	if !isFloat {
+		f = float64(i)
 	}
-	return xf.Rk.String()
+	return wb.number(xf.Index, f, xf.Rk.String())
 }
 
+// RK is the 30-bit number of an RK record, [MS-XLS] 2.5.217.
 type RK uint32
 
 func (rk RK) number() (intNum int64, floatNum float64, isFloat bool) {
-	multiplied := rk & 1
-	isInt := rk & 2
-	val := int32(rk) >> 2
-	if isInt == 0 {
-		isFloat = true
-		floatNum = math.Float64frombits(uint64(val) << 34)
-		if multiplied != 0 {
-			floatNum = floatNum / 100
+	div100 := rk&1 != 0
+	if rk&2 == 0 { // upper 30 bits of an IEEE double
+		floatNum = math.Float64frombits(uint64(rk&^3) << 32)
+		if div100 {
+			floatNum /= 100
 		}
-		return
+		return 0, floatNum, true
 	}
-	if multiplied != 0 {
-		isFloat = true
-		floatNum = float64(val) / 100
-		return
+	val := int32(rk) >> 2
+	if div100 {
+		return 0, float64(val) / 100, true
 	}
 	return int64(val), 0, false
 }
@@ -113,7 +133,7 @@ func (rk RK) number() (intNum int64, floatNum float64, isFloat bool) {
 func (rk RK) String() string {
 	i, f, isFloat := rk.number()
 	if isFloat {
-		return strconv.FormatFloat(f, 'f', -1, 64)
+		return plainFloat(f)
 	}
 	return strconv.FormatInt(i, 10)
 }
@@ -128,39 +148,6 @@ func (rk RK) Float() (float64, error) {
 	return f, nil
 }
 
-type MulrkCol struct {
-	Col
-	Xfrks    []XfRk
-	LastColB uint16
-}
-
-func (c *MulrkCol) LastCol() uint16 {
-	return c.LastColB
-}
-
-func (c *MulrkCol) String(wb *WorkBook) []string {
-	var res = make([]string, len(c.Xfrks))
-	for i := 0; i < len(c.Xfrks); i++ {
-		xfrk := c.Xfrks[i]
-		res[i] = xfrk.String(wb)
-	}
-	return res
-}
-
-type MulBlankCol struct {
-	Col
-	Xfs      []uint16
-	LastColB uint16
-}
-
-func (c *MulBlankCol) LastCol() uint16 {
-	return c.LastColB
-}
-
-func (c *MulBlankCol) String(wb *WorkBook) []string {
-	return make([]string, len(c.Xfs))
-}
-
 type NumberCol struct {
 	Col
 	Index uint16
@@ -168,25 +155,10 @@ type NumberCol struct {
 }
 
 func (c *NumberCol) String(wb *WorkBook) []string {
-	if fNo := wb.Xfs[c.Index].formatNo(); fNo != 0 {
-		t := timeFromExcelTime(c.Float, wb.dateMode == 1)
-		return []string{yymmdd.Format(t, wb.Formats[fNo].str)}
-	}
-	return []string{strconv.FormatFloat(c.Float, 'f', -1, 64)}
+	return []string{wb.number(c.Index, c.Float, plainFloat(c.Float))}
 }
 
-type FormulaStringCol struct {
-	Col
-	RenderedValue string
-}
-
-func (c *FormulaStringCol) String(wb *WorkBook) []string {
-	return []string{c.RenderedValue}
-}
-
-//str, err = wb.get_string(buf_item, size)
-//wb.sst[offset_pre] = wb.sst[offset_pre] + str
-
+// FormulaCol is a FORMULA record; String returns its cached result.
 type FormulaCol struct {
 	Header struct {
 		Col
@@ -196,10 +168,39 @@ type FormulaCol struct {
 		_       uint32
 	}
 	Bts []byte
+	str string
+}
+
+var errorNames = map[byte]string{
+	0x00: "#NULL!", 0x07: "#DIV/0!", 0x0F: "#VALUE!", 0x17: "#REF!",
+	0x1D: "#NAME?", 0x24: "#NUM!", 0x2A: "#N/A",
+}
+
+func boolErr(v byte, isErr bool) string {
+	switch {
+	case isErr:
+		return errorNames[v]
+	case v != 0:
+		return "TRUE"
+	}
+	return "FALSE"
 }
 
 func (c *FormulaCol) String(wb *WorkBook) []string {
-	return []string{"FormulaCol"}
+	r := c.Header.Result
+	if r[6] == 0xFF && r[7] == 0xFF { // not a number: type in the first byte
+		switch r[0] {
+		case 0:
+			return []string{c.str}
+		case 1:
+			return []string{boolErr(r[2], false)}
+		case 2:
+			return []string{boolErr(r[2], true)}
+		}
+		return []string{""}
+	}
+	f := float64frombits(r[:])
+	return []string{wb.number(c.Header.IndexXf, f, plainFloat(f))}
 }
 
 type RkCol struct {
@@ -217,8 +218,12 @@ type LabelsstCol struct {
 	Sst uint32
 }
 
+// String returns "" for an index outside the shared string table.
 func (c *LabelsstCol) String(wb *WorkBook) []string {
-	return []string{wb.sst[int(c.Sst)]}
+	if uint64(c.Sst) < uint64(len(wb.sst)) {
+		return []string{wb.sst[c.Sst]}
+	}
+	return []string{""}
 }
 
 type labelCol struct {
@@ -238,3 +243,19 @@ type BlankCol struct {
 func (c *BlankCol) String(wb *WorkBook) []string {
 	return []string{""}
 }
+
+// BoolErrCol is a BOOLERR record: TRUE, FALSE or an error name such as #N/A.
+type BoolErrCol struct {
+	Col
+	Xf    uint16
+	Val   byte
+	IsErr bool
+}
+
+func (c *BoolErrCol) String(wb *WorkBook) []string {
+	return []string{boolErr(c.Val, c.IsErr)}
+}
+
+func (c *FormulaCol) Row() uint16      { return c.Header.RowB }
+func (c *FormulaCol) FirstCol() uint16 { return c.Header.FirstColB }
+func (c *FormulaCol) LastCol() uint16  { return c.Header.FirstColB }

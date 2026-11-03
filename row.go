@@ -10,48 +10,55 @@ type rowInfo struct {
 	Flags    uint32
 }
 
-//Row the data of one row
+// Row the data of one row
 type Row struct {
 	wb   *WorkBook
 	info *rowInfo
 	cols map[uint16]contentHandler
 }
 
-//Col Get the Nth Col from the Row, if has not, return nil.
-//Suggest use Has function to test it.
+// Col returns the text of column i, or "" if the cell is missing or i is out of range.
 func (r *Row) Col(i int) string {
-	serial := uint16(i)
-	if ch, ok := r.cols[serial]; ok {
-		strs := ch.String(r.wb)
-		return strs[0]
-	} else {
-		for _, v := range r.cols {
-			if v.FirstCol() <= serial && v.LastCol() >= serial {
-				strs := v.String(r.wb)
-				return strs[serial-v.FirstCol()]
-			}
+	if r == nil || i < 0 || i > maxCol {
+		return ""
+	}
+	if ch, ok := r.cols[uint16(i)]; ok {
+		if strs := ch.String(r.wb); len(strs) > 0 {
+			return strs[0]
 		}
 	}
 	return ""
 }
 
-//ColExact Get the Nth Col from the Row, if has not, return nil.
-//For merged cells value is returned for first cell only
+// ColExact is the same as Col; every cell is stored on its own.
 func (r *Row) ColExact(i int) string {
-	serial := uint16(i)
-	if ch, ok := r.cols[serial]; ok {
-		strs := ch.String(r.wb)
-		return strs[0]
-	}
-	return ""
+	return r.Col(i)
 }
 
-//LastCol Get the number of Last Col of the Row.
+// LastCol returns the column index after the last cell of the row, like the
+// colMac field of the ROW record.
 func (r *Row) LastCol() int {
+	if r == nil {
+		return 0
+	}
 	return int(r.info.Lcell)
 }
 
-//FirstCol Get the number of First Col of the Row.
+// FirstCol returns the index of the first column of the row.
 func (r *Row) FirstCol() int {
+	if r == nil {
+		return 0
+	}
 	return int(r.info.Fcell)
+}
+
+// values returns all cell texts from column 0.
+func (r *Row) values() []string {
+	data := make([]string, r.info.Lcell)
+	for c := range r.cols {
+		if int(c) < len(data) {
+			data[c] = r.Col(int(c))
+		}
+	}
+	return data
 }

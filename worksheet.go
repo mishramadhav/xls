@@ -1,10 +1,8 @@
 package xls
 
 import (
-	"bytes"
-	"encoding/binary"
-	"fmt"
-	"io"
+	"errors"
+	"math"
 	"unicode/utf16"
 )
 
@@ -16,6 +14,12 @@ const (
 	WorkSheetVeryHidden TWorkSheetVisibility = 2
 )
 
+// maxSheets bounds BOUNDSHEET records: each sheet is parsed again on access.
+const maxSheets = 1024
+
+// maxCol is the last column BIFF8 allows.
+const maxCol = 255
+
 type boundsheet struct {
 	Filepos uint32
 	Visible byte
@@ -23,7 +27,7 @@ type boundsheet struct {
 	Name    byte
 }
 
-//WorkSheet in one WorkBook
+// WorkSheet in one WorkBook
 type WorkSheet struct {
 	bs         *boundsheet
 	wb         *WorkBook
@@ -31,221 +35,251 @@ type WorkSheet struct {
 	Selected   bool
 	Visibility TWorkSheetVisibility
 	rows       map[uint16]*Row
-	//NOTICE: this is the max row number of the sheet, so it should be count -1
+	// MaxRow is the highest row number of the sheet (the count minus one).
 	MaxRow      uint16
+	HyperLinks  []*HyperLink
 	parsed      bool
+	err         error
 	rightToLeft bool
 }
 
+// Err reports why the sheet could not be read completely, if so. Cells read
+// before the problem are still available.
+func (w *WorkSheet) Err() error { return w.err }
+
+// Row returns row i, or nil if the sheet has no cell or ROW record for it.
 func (w *WorkSheet) Row(i int) *Row {
-	row := w.rows[uint16(i)]
-	if row != nil {
-		row.wb = w.wb
+	if i < 0 || i > 0xFFFF {
+		return nil
 	}
-	return row
+	return w.rows[uint16(i)]
 }
 
-func (w *WorkSheet) parse(buf io.ReadSeeker) {
+// parse reads the sheet substream that starts at the BOF record in data.
+func (w *WorkSheet) parse(data []byte) error {
 	w.rows = make(map[uint16]*Row)
-	b := new(bof)
-	var bof_pre *bof
-	var col_pre interface{}
-	for {
-		if err := binary.Read(buf, binary.LittleEndian, b); err == nil {
-			bof_pre, col_pre = w.parseBof(buf, b, bof_pre, col_pre)
-			if b.Id == 0xa {
-				break
-			}
-		} else {
-			fmt.Println(err)
-			break
-		}
+	rr := &recReader{data: data}
+	id, body, ok := rr.next()
+	if !ok || id != recBOF || len(body) < 4 {
+		return errors.New("xls: sheet does not start with a BOF record")
 	}
-	w.parsed = true
-}
-
-func (w *WorkSheet) parseBof(buf io.ReadSeeker, b *bof, pre *bof, col_pre interface{}) (*bof, interface{}) {
-	var col interface{}
-	var bts = make([]byte, b.Size)
-	binary.Read(buf, binary.LittleEndian, bts)
-	buf = bytes.NewReader(bts)
-	switch b.Id {
-	// case 0x0E5: //MERGEDCELLS
-	// ws.mergedCells(buf)
-	case 0x23E: // WINDOW2
-		var sheetOptions, firstVisibleRow, firstVisibleColumn uint16
-		binary.Read(buf, binary.LittleEndian, &sheetOptions)
-		binary.Read(buf, binary.LittleEndian, &firstVisibleRow)    // not valuable
-		binary.Read(buf, binary.LittleEndian, &firstVisibleColumn) // not valuable
-		//buf.Seek(int64(b.Size)-2*3, 1)
-		w.rightToLeft = (sheetOptions & 0x40) != 0
-		w.Selected = (sheetOptions & 0x400) != 0
-	case 0x208: //ROW
-		r := new(rowInfo)
-		binary.Read(buf, binary.LittleEndian, r)
-		w.addRow(r)
-	case 0x0BD: //MULRK
-		mc := new(MulrkCol)
-		size := (b.Size - 6) / 6
-		binary.Read(buf, binary.LittleEndian, &mc.Col)
-		mc.Xfrks = make([]XfRk, size)
-		for i := uint16(0); i < size; i++ {
-			binary.Read(buf, binary.LittleEndian, &mc.Xfrks[i])
+	var formula *FormulaCol
+	for depth := 1; ; {
+		id, body, ok := rr.next()
+		if !ok {
+			return errors.New("xls: sheet truncated before EOF record")
 		}
-		binary.Read(buf, binary.LittleEndian, &mc.LastColB)
-		col = mc
-	case 0x0BE: //MULBLANK
-		mc := new(MulBlankCol)
-		size := (b.Size - 6) / 2
-		binary.Read(buf, binary.LittleEndian, &mc.Col)
-		mc.Xfs = make([]uint16, size)
-		for i := uint16(0); i < size; i++ {
-			binary.Read(buf, binary.LittleEndian, &mc.Xfs[i])
-		}
-		binary.Read(buf, binary.LittleEndian, &mc.LastColB)
-		col = mc
-	case 0x203: //NUMBER
-		col = new(NumberCol)
-		binary.Read(buf, binary.LittleEndian, col)
-	case 0x06: //FORMULA
-		c := new(FormulaCol)
-		binary.Read(buf, binary.LittleEndian, &c.Header)
-		c.Bts = make([]byte, b.Size-20)
-		binary.Read(buf, binary.LittleEndian, &c.Bts)
-		col = c
-	case 0x207: //STRING = FORMULA-VALUE is expected right after FORMULA
-		if ch, ok := col_pre.(*FormulaCol); ok {
-			c := new(FormulaStringCol)
-			c.Col = ch.Header.Col
-			var cStringLen uint16
-			binary.Read(buf, binary.LittleEndian, &cStringLen)
-			str, err := w.wb.get_string(buf, cStringLen)
-			if nil == err {
-				c.RenderedValue = str
+		switch id {
+		case recBOF:
+			depth++
+			continue
+		case recEOF:
+			if depth--; depth == 0 {
+				return nil
 			}
-			col = c
+			continue
 		}
-	case 0x27e: //RK
-		col = new(RkCol)
-		binary.Read(buf, binary.LittleEndian, col)
-	case 0xFD: //LABELSST
-		col = new(LabelsstCol)
-		binary.Read(buf, binary.LittleEndian, col)
-	case 0x204:
-		c := new(labelCol)
-		binary.Read(buf, binary.LittleEndian, &c.BlankCol)
-		var count uint16
-		binary.Read(buf, binary.LittleEndian, &count)
-		c.Str, _ = w.wb.get_string(buf, count)
-		col = c
-	case 0x201: //BLANK
-		col = new(BlankCol)
-		binary.Read(buf, binary.LittleEndian, col)
-	case 0x1b8: //HYPERLINK
-		var hy HyperLink
-		binary.Read(buf, binary.LittleEndian, &hy.CellRange)
-		buf.Seek(20, 1)
-		var flag uint32
-		binary.Read(buf, binary.LittleEndian, &flag)
-		var count uint32
-
-		if flag&0x14 != 0 {
-			binary.Read(buf, binary.LittleEndian, &count)
-			hy.Description = b.utf16String(buf, count)
+		if depth > 1 {
+			continue
 		}
-		if flag&0x80 != 0 {
-			binary.Read(buf, binary.LittleEndian, &count)
-			hy.TargetFrame = b.utf16String(buf, count)
+		// A string result follows its FORMULA, possibly after array/shared formula records.
+		if id != recString && id != recShrFmla && id != recArray && id != recTable {
+			formula = nil
 		}
-		if flag&0x1 != 0 {
-			var guid [2]uint64
-			binary.Read(buf, binary.BigEndian, &guid)
-			if guid[0] == 0xE0C9EA79F9BACE11 && guid[1] == 0x8C8200AA004BA90B { //URL
-				hy.IsUrl = true
-				binary.Read(buf, binary.LittleEndian, &count)
-				hy.Url = b.utf16String(buf, count/2)
-			} else if guid[0] == 0x303000000000000 && guid[1] == 0xC000000000000046 { //URL{
-				var upCount uint16
-				binary.Read(buf, binary.LittleEndian, &upCount)
-				binary.Read(buf, binary.LittleEndian, &count)
-				bts := make([]byte, count)
-				binary.Read(buf, binary.LittleEndian, &bts)
-				hy.ShortedFilePath = string(bts)
-				buf.Seek(24, 1)
-				binary.Read(buf, binary.LittleEndian, &count)
-				if count > 0 {
-					binary.Read(buf, binary.LittleEndian, &count)
-					buf.Seek(2, 1)
-					hy.ExtendedFilePath = b.utf16String(buf, count/2+1)
-				}
+		switch id {
+		case recWindow2:
+			if len(body) >= 2 {
+				opts := le16(body, 0)
+				w.rightToLeft = opts&0x40 != 0
+				w.Selected = opts&0x400 != 0
+			}
+		case recRow:
+			r := new(rowInfo)
+			if readStruct(body, r) {
+				r.Fcell, r.Lcell = min(r.Fcell, maxCol+1), min(r.Lcell, maxCol+1)
+				w.addRow(r)
+			}
+		case recMulRK:
+			w.addMulRK(body)
+		case recMulBlank:
+			w.addMulBlank(body)
+		case recNumber:
+			if len(body) >= 14 {
+				w.addCell(&NumberCol{Col: cellPos(body), Index: le16(body, 4), Float: float64frombits(body[6:14])})
+			}
+		case recRK:
+			if len(body) >= 10 {
+				w.addCell(&RkCol{Col: cellPos(body), Xfrk: XfRk{Index: le16(body, 4), Rk: RK(le32(body, 6))}})
+			}
+		case recLabelSST:
+			if len(body) >= 10 {
+				w.addCell(&LabelsstCol{Col: cellPos(body), Xf: le16(body, 4), Sst: le32(body, 6)})
+			}
+		case recLabel:
+			if len(body) >= 8 {
+				str := w.wb.xlString(body[8:], int(le16(body, 6)))
+				w.addCell(&labelCol{BlankCol: BlankCol{Col: cellPos(body), Xf: le16(body, 4)}, Str: str})
+			}
+		case recBlank:
+			if len(body) >= 6 {
+				w.addCell(&BlankCol{Col: cellPos(body), Xf: le16(body, 4)})
+			}
+		case recBoolErr:
+			if len(body) >= 8 {
+				w.addCell(&BoolErrCol{Col: cellPos(body), Xf: le16(body, 4), Val: body[6], IsErr: body[7] != 0})
+			}
+		case recFormula:
+			if len(body) >= 20 {
+				c := &FormulaCol{}
+				readStruct(body[:20], &c.Header)
+				c.Bts = body[20:]
+				w.addCell(c)
+				formula = c
+			}
+		case recString:
+			if formula != nil && len(body) >= 2 {
+				formula.str = w.wb.xlString(body[2:], int(le16(body, 0)))
+			}
+		case recHLink:
+			if hl := parseHyperLink(body); hl != nil {
+				w.HyperLinks = append(w.HyperLinks, hl)
 			}
 		}
-		if flag&0x8 != 0 {
-			binary.Read(buf, binary.LittleEndian, &count)
-			var bts = make([]uint16, count)
-			binary.Read(buf, binary.LittleEndian, &bts)
-			runes := utf16.Decode(bts[:len(bts)-1])
-			hy.TextMark = string(runes)
+	}
+}
+
+func float64frombits(b []byte) float64 {
+	return math.Float64frombits(uint64(le32(b, 0)) | uint64(le32(b, 4))<<32)
+}
+
+func cellPos(b []byte) Col {
+	return Col{RowB: le16(b, 0), FirstColB: le16(b, 2)}
+}
+
+func (w *WorkSheet) addMulRK(b []byte) {
+	if len(b) < 12 {
+		return
+	}
+	row, first := le16(b, 0), le16(b, 2)
+	for i := 0; i < (len(b)-6)/6; i++ {
+		col := int(first) + i
+		if col > maxCol {
+			return
 		}
-
-		w.addRange(&hy.CellRange, &hy)
-	case 0x809:
-		buf.Seek(int64(b.Size), 1)
-	case 0xa:
-	default:
-		// log.Printf("Unknow %X,%d\n", b.Id, b.Size)
-		buf.Seek(int64(b.Size), 1)
+		off := 4 + 6*i
+		w.addCell(&RkCol{Col: Col{RowB: row, FirstColB: uint16(col)}, Xfrk: XfRk{Index: le16(b, off), Rk: RK(le32(b, off+2))}})
 	}
-	if col != nil {
-		w.add(col)
-	}
-	return b, col
 }
 
-func (w *WorkSheet) add(content interface{}) {
-	if ch, ok := content.(contentHandler); ok {
-		if col, ok := content.(Coler); ok {
-			w.addCell(col, ch)
+func (w *WorkSheet) addMulBlank(b []byte) {
+	if len(b) < 8 {
+		return
+	}
+	row, first := le16(b, 0), le16(b, 2)
+	for i := 0; i < (len(b)-6)/2; i++ {
+		col := int(first) + i
+		if col > maxCol {
+			return
 		}
-	}
-
-}
-
-func (w *WorkSheet) addCell(col Coler, ch contentHandler) {
-	w.addContent(col.Row(), ch)
-}
-
-func (w *WorkSheet) addRange(rang Ranger, ch contentHandler) {
-
-	for i := rang.FirstRow(); i <= rang.LastRow(); i++ {
-		w.addContent(i, ch)
+		w.addCell(&BlankCol{Col: Col{RowB: row, FirstColB: uint16(col)}, Xf: le16(b, 4+2*i)})
 	}
 }
 
-func (w *WorkSheet) addContent(row_num uint16, ch contentHandler) {
-	var row *Row
-	var ok bool
-	if row, ok = w.rows[row_num]; !ok {
-		info := new(rowInfo)
-		info.Index = row_num
-		row = w.addRow(info)
+type cell interface {
+	contentHandler
+	Coler
+}
+
+func (w *WorkSheet) addCell(c cell) {
+	if c.FirstCol() > maxCol {
+		return
 	}
-	if row.info.Lcell < ch.LastCol() {
-		row.info.Lcell = ch.LastCol()
+	row := w.rows[c.Row()]
+	if row == nil {
+		row = w.addRow(&rowInfo{Index: c.Row()})
 	}
-	row.cols[ch.FirstCol()] = ch
+	if row.info.Lcell <= c.LastCol() {
+		row.info.Lcell = c.LastCol() + 1
+	}
+	row.cols[c.FirstCol()] = c
 }
 
 func (w *WorkSheet) addRow(info *rowInfo) (row *Row) {
 	if info.Index > w.MaxRow {
 		w.MaxRow = info.Index
 	}
-	var ok bool
-	if row, ok = w.rows[info.Index]; ok {
-		row.info = info
+	if row = w.rows[info.Index]; row != nil {
+		row.info.Fcell = min(row.info.Fcell, info.Fcell)
+		row.info.Lcell = max(row.info.Lcell, info.Lcell)
 	} else {
-		row = &Row{info: info, cols: make(map[uint16]contentHandler)}
+		row = &Row{wb: w.wb, info: info, cols: make(map[uint16]contentHandler)}
 		w.rows[info.Index] = row
 	}
 	return
+}
+
+// urlMoniker is the CLSID of a URL moniker, [MS-OSHARED] 2.3.7.
+var urlMoniker = [16]byte{0xE0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9, 0x0B}
+
+// parseHyperLink reads an HLINK record ([MS-XLS] 2.4.140). Moniker types other
+// than URL are not decoded.
+func parseHyperLink(b []byte) *HyperLink {
+	if len(b) < 32 {
+		return nil
+	}
+	hl := &HyperLink{CellRange: CellRange{le16(b, 0), le16(b, 2), le16(b, 4), le16(b, 6)}}
+	flags := le32(b, 28)
+	p := 32
+	str := func() (string, bool) { // HyperlinkString: u32 count, then UTF-16 with NUL
+		if len(b) < p+4 {
+			return "", false
+		}
+		n := int(le32(b, p))
+		if n > (len(b)-p-4)/2 {
+			return "", false
+		}
+		u := make([]uint16, n)
+		for i := range u {
+			u[i] = le16(b, p+4+2*i)
+		}
+		p += 4 + 2*n
+		if n > 0 && u[n-1] == 0 {
+			u = u[:n-1]
+		}
+		return string(utf16.Decode(u)), true
+	}
+	var ok bool
+	if flags&0x10 != 0 {
+		if hl.Description, ok = str(); !ok {
+			return hl
+		}
+	}
+	if flags&0x80 != 0 {
+		if hl.TargetFrame, ok = str(); !ok {
+			return hl
+		}
+	}
+	if flags&0x1 != 0 && flags&0x100 == 0 {
+		if len(b) < p+20 || [16]byte(b[p:p+16]) != urlMoniker {
+			return hl
+		}
+		n := int(le32(b, p+16))
+		p += 20
+		if n > len(b)-p {
+			return hl
+		}
+		u := make([]uint16, n/2)
+		for i := range u {
+			u[i] = le16(b, p+2*i)
+		}
+		for len(u) > 0 && u[len(u)-1] == 0 {
+			u = u[:len(u)-1]
+		}
+		hl.Url, hl.IsUrl = string(utf16.Decode(u)), true
+		p += n
+	}
+	if flags&0x8 != 0 {
+		hl.TextMark, _ = str()
+	}
+	return hl
 }

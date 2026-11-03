@@ -3,13 +3,11 @@ package xls
 import (
 	"bytes"
 	"encoding/binary"
-	"golang.org/x/text/encoding/charmap"
-	"io"
-	"os"
-	"unicode/utf16"
+	"errors"
+	"fmt"
 )
 
-//xls workbook type
+// WorkBook is an xls workbook.
 type WorkBook struct {
 	Is5ver   bool
 	Type     uint16
@@ -17,307 +15,194 @@ type WorkBook struct {
 	Xfs      []st_xf_data
 	Fonts    []Font
 	Formats  map[uint16]*Format
-	//All the sheets from the workbook
-	sheets         []*WorkSheet
-	Author         string
-	rs             io.ReadSeeker
-	sst            []string
-	continue_utf16 uint16
-	continue_rich  uint16
-	continue_apsb  uint32
-	dateMode       uint16
+	// sheets from the workbook
+	sheets   []*WorkSheet
+	Author   string
+	data     []byte
+	sst      []string
+	dateMode uint16
 }
 
-//read workbook from ole2 file
-func newWorkBookFromOle2(rs io.ReadSeeker) *WorkBook {
-	wb := new(WorkBook)
-	wb.Formats = make(map[uint16]*Format)
-	// wb.bts = bts
-	wb.rs = rs
-	wb.sheets = make([]*WorkSheet, 0)
-	wb.Parse(rs)
-	return wb
+// readStruct fills v from b and reports whether b was long enough.
+func readStruct(b []byte, v any) bool {
+	return len(b) >= binary.Size(v) && binary.Read(bytes.NewReader(b), binary.LittleEndian, v) == nil
 }
 
-func (w *WorkBook) Parse(buf io.ReadSeeker) {
-	b := new(bof)
-	bof_pre := new(bof)
-	// buf := bytes.NewReader(bts)
-	offset := 0
-	for {
-		if err := binary.Read(buf, binary.LittleEndian, b); err == nil {
-			bof_pre, b, offset = w.parseBof(buf, b, bof_pre, offset)
-		} else {
-			break
+// parseGlobals reads the workbook globals substream up to its EOF record.
+func (w *WorkBook) parseGlobals() error {
+	rr := &recReader{data: w.data}
+	id, body, ok := rr.next()
+	if !ok || id != recBOF || len(body) < 4 {
+		return errors.New("xls: workbook stream does not start with a BOF record")
+	}
+	if le16(body, 2) != 0x0005 {
+		return errors.New("xls: first substream is not the workbook globals")
+	}
+	w.Is5ver = le16(body, 0) != 0x600
+	w.Type = le16(body, 2)
+	for depth := 1; ; {
+		id, body, ok := rr.next()
+		if !ok {
+			return errors.New("xls: workbook globals truncated before EOF record")
+		}
+		switch id {
+		case recBOF:
+			depth++
+			continue
+		case recEOF:
+			if depth--; depth == 0 {
+				return nil
+			}
+			continue
+		}
+		if depth > 1 {
+			continue
+		}
+		switch id {
+		case recFilePass:
+			return errors.New("xls: encrypted workbook is not supported")
+		case recCodepage:
+			if len(body) >= 2 {
+				w.Codepage = le16(body, 0)
+			}
+		case recDateMode:
+			if len(body) >= 2 {
+				w.dateMode = le16(body, 0)
+			}
+		case recSST:
+			segs := [][]byte{body}
+			for next, ok := rr.peekID(); ok && next == recContinue; next, ok = rr.peekID() {
+				_, b, ok := rr.next()
+				if !ok {
+					return errors.New("xls: truncated CONTINUE record")
+				}
+				segs = append(segs, b)
+			}
+			sst, err := parseSST(segs)
+			if err != nil {
+				return err
+			}
+			w.sst = sst
+		case recBoundSheet:
+			w.addSheet(body)
+		case recXF:
+			w.addXf(body)
+		case recFont:
+			w.addFont(body)
+		case recFormat:
+			w.addFormat(body)
 		}
 	}
 }
 
-func (w *WorkBook) addXf(xf st_xf_data) {
+func (w *WorkBook) addSheet(b []byte) {
+	if len(b) < 7 {
+		return
+	}
+	if len(w.sheets) >= maxSheets {
+		return
+	}
+	bs := &boundsheet{Filepos: le32(b, 0), Visible: b[4] & 3, Type: b[5], Name: b[6]}
+	name := w.xlString(b[7:], int(b[6]))
+	w.sheets = append(w.sheets, &WorkSheet{bs: bs, Name: name, wb: w, Visibility: TWorkSheetVisibility(bs.Visible)})
+}
+
+// addXf keeps a zero XF for a short record so later XF indexes stay aligned.
+func (w *WorkBook) addXf(b []byte) {
+	if w.Is5ver {
+		xf := new(Xf5)
+		readStruct(b, xf)
+		w.Xfs = append(w.Xfs, xf)
+		return
+	}
+	xf := new(Xf8)
+	readStruct(b, xf)
 	w.Xfs = append(w.Xfs, xf)
 }
 
-func (w *WorkBook) addFont(font *FontInfo, buf io.ReadSeeker) {
-	name, _ := w.get_string(buf, uint16(font.NameB))
-	w.Fonts = append(w.Fonts, Font{Info: font, Name: name})
-}
-
-func (w *WorkBook) addFormat(format *Format) {
-	if w.Formats == nil {
-		os.Exit(1)
+func (w *WorkBook) addFont(b []byte) {
+	f := new(FontInfo)
+	if !readStruct(b, f) {
+		w.Fonts = append(w.Fonts, Font{Info: f})
+		return
 	}
-	w.Formats[format.Head.Index] = format
+	name := w.xlString(b[binary.Size(f):], int(f.NameB))
+	w.Fonts = append(w.Fonts, Font{Info: f, Name: name})
 }
 
-func (wb *WorkBook) parseBof(buf io.ReadSeeker, b *bof, pre *bof, offset_pre int) (after *bof, after_using *bof, offset int) {
-	after = b
-	after_using = pre
-	var bts = make([]byte, b.Size)
-	binary.Read(buf, binary.LittleEndian, bts)
-	buf_item := bytes.NewReader(bts)
-	switch b.Id {
-	case 0x809:
-		bif := new(biffHeader)
-		binary.Read(buf_item, binary.LittleEndian, bif)
-		if bif.Ver != 0x600 {
-			wb.Is5ver = true
-		}
-		wb.Type = bif.Type
-	case 0x042: // CODEPAGE
-		binary.Read(buf_item, binary.LittleEndian, &wb.Codepage)
-	case 0x3c: // CONTINUE
-		if pre.Id == 0xfc {
-			var size uint16
-			var err error
-			if wb.continue_utf16 >= 1 {
-				size = wb.continue_utf16
-				wb.continue_utf16 = 0
-			} else {
-				err = binary.Read(buf_item, binary.LittleEndian, &size)
-			}
-			for err == nil && offset_pre < len(wb.sst) {
-				var str string
-				str, err = wb.get_string(buf_item, size)
-				wb.sst[offset_pre] = wb.sst[offset_pre] + str
-
-				if err == io.EOF {
-					break
-				}
-
-				offset_pre++
-				err = binary.Read(buf_item, binary.LittleEndian, &size)
-			}
-		}
-		offset = offset_pre
-		after = pre
-		after_using = b
-	case 0xfc: // SST
-		info := new(SstInfo)
-		binary.Read(buf_item, binary.LittleEndian, info)
-		wb.sst = make([]string, info.Count)
-		var size uint16
-		var i = 0
-		// dont forget to initialize offset
-		offset = 0
-		for ; i < int(info.Count); i++ {
-			var err error
-			err = binary.Read(buf_item, binary.LittleEndian, &size)
-			if err == nil {
-				var str string
-				str, err = wb.get_string(buf_item, size)
-				wb.sst[i] = wb.sst[i] + str
-			}
-
-			if err == io.EOF {
-				break
-			}
-		}
-		offset = i
-	case 0x85: // boundsheet
-		var bs = new(boundsheet)
-		binary.Read(buf_item, binary.LittleEndian, bs)
-		// different for BIFF5 and BIFF8
-		wb.addSheet(bs, buf_item)
-	case 0x0e0: // XF
-		if wb.Is5ver {
-			xf := new(Xf5)
-			binary.Read(buf_item, binary.LittleEndian, xf)
-			wb.addXf(xf)
-		} else {
-			xf := new(Xf8)
-			binary.Read(buf_item, binary.LittleEndian, xf)
-			wb.addXf(xf)
-		}
-	case 0x031: // FONT
-		f := new(FontInfo)
-		binary.Read(buf_item, binary.LittleEndian, f)
-		wb.addFont(f, buf_item)
-	case 0x41E: //FORMAT
-		font := new(Format)
-		binary.Read(buf_item, binary.LittleEndian, &font.Head)
-		font.str, _ = wb.get_string(buf_item, font.Head.Size)
-		wb.addFormat(font)
-	case 0x22: //DATEMODE
-		binary.Read(buf_item, binary.LittleEndian, &wb.dateMode)
+func (w *WorkBook) addFormat(b []byte) {
+	if len(b) < 4 {
+		return
 	}
-	return
-}
-func decodeWindows1251(enc []byte) string {
-	dec := charmap.Windows1251.NewDecoder()
-	out, _ := dec.Bytes(enc)
-	return string(out)
-}
-func (w *WorkBook) get_string(buf io.ReadSeeker, size uint16) (res string, err error) {
+	f := new(Format)
+	f.Head.Index = le16(b, 0)
 	if w.Is5ver {
-		var bts = make([]byte, size)
-		_, err = buf.Read(bts)
-		res = decodeWindows1251(bts)
-		//res = string(bts)
+		f.Head.Size = uint16(b[2])
+		f.str = w.xlString(b[3:], int(f.Head.Size))
 	} else {
-		var richtext_num = uint16(0)
-		var phonetic_size = uint32(0)
-		var flag byte
-		err = binary.Read(buf, binary.LittleEndian, &flag)
-		if flag&0x8 != 0 {
-			err = binary.Read(buf, binary.LittleEndian, &richtext_num)
-		} else if w.continue_rich > 0 {
-			richtext_num = w.continue_rich
-			w.continue_rich = 0
-		}
-		if flag&0x4 != 0 {
-			err = binary.Read(buf, binary.LittleEndian, &phonetic_size)
-		} else if w.continue_apsb > 0 {
-			phonetic_size = w.continue_apsb
-			w.continue_apsb = 0
-		}
-		if flag&0x1 != 0 {
-			var bts = make([]uint16, size)
-			var i = uint16(0)
-			for ; i < size && err == nil; i++ {
-				err = binary.Read(buf, binary.LittleEndian, &bts[i])
-			}
-
-			// when eof found, we dont want to append last element
-			var runes []rune
-			if err == io.EOF {
-				i = i - 1
-			}
-			runes = utf16.Decode(bts[:i])
-
-			res = string(runes)
-			if i < size {
-				w.continue_utf16 = size - i
-			}
-
-		} else {
-			var bts = make([]byte, size)
-			var n int
-			n, err = buf.Read(bts)
-			if uint16(n) < size {
-				w.continue_utf16 = size - uint16(n)
-				err = io.EOF
-			}
-
-			var bts1 = make([]uint16, n)
-			for k, v := range bts[:n] {
-				bts1[k] = uint16(v)
-			}
-			runes := utf16.Decode(bts1)
-			res = string(runes)
-		}
-		if richtext_num > 0 {
-			var bts []byte
-			var seek_size int64
-			if w.Is5ver {
-				seek_size = int64(2 * richtext_num)
-			} else {
-				seek_size = int64(4 * richtext_num)
-			}
-			bts = make([]byte, seek_size)
-			err = binary.Read(buf, binary.LittleEndian, bts)
-			if err == io.EOF {
-				w.continue_rich = richtext_num
-			}
-
-			// err = binary.Read(buf, binary.LittleEndian, bts)
-		}
-		if phonetic_size > 0 {
-			var bts []byte
-			bts = make([]byte, phonetic_size)
-			err = binary.Read(buf, binary.LittleEndian, bts)
-			if err == io.EOF {
-				w.continue_apsb = phonetic_size
-			}
-		}
+		f.Head.Size = le16(b, 2)
+		f.str = w.xlString(b[4:], int(f.Head.Size))
 	}
-	return
+	w.Formats[f.Head.Index] = f
 }
 
-func (w *WorkBook) addSheet(sheet *boundsheet, buf io.ReadSeeker) {
-	name, _ := w.get_string(buf, uint16(sheet.Name))
-	w.sheets = append(w.sheets, &WorkSheet{bs: sheet, Name: name, wb: w, Visibility: TWorkSheetVisibility(sheet.Visible)})
+// prepareSheet parses the sheet substream, keeping any cells read before an error.
+func (w *WorkBook) prepareSheet(sheet *WorkSheet) error {
+	if int64(sheet.bs.Filepos) >= int64(len(w.data)) {
+		return fmt.Errorf("xls: sheet %q offset outside the workbook stream", sheet.Name)
+	}
+	return sheet.parse(w.data[sheet.bs.Filepos:])
 }
 
-//reading a sheet from the compress file to memory, you should call this before you try to get anything from sheet
-func (w *WorkBook) prepareSheet(sheet *WorkSheet) {
-	w.rs.Seek(int64(sheet.bs.Filepos), 0)
-	sheet.parse(w.rs)
-}
-
-//Get one sheet by its number
+// GetSheet returns one sheet by its number, or nil if there is no such sheet.
+// Parse problems do not panic; see WorkSheet.Err.
 func (w *WorkBook) GetSheet(num int) *WorkSheet {
-	if num < len(w.sheets) {
-		s := w.sheets[num]
-		if !s.parsed {
-			w.prepareSheet(s)
-		}
-		return s
-	} else {
+	if num < 0 || num >= len(w.sheets) {
 		return nil
 	}
+	s := w.sheets[num]
+	if !s.parsed {
+		s.err = w.safePrepare(s)
+	}
+	return s
 }
 
-//Get the number of all sheets, look into example
+func (w *WorkBook) safePrepare(s *WorkSheet) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("xls: malformed sheet %q: %v", s.Name, r)
+		}
+		s.parsed = true
+	}()
+	return w.prepareSheet(s)
+}
+
+// NumSheets returns the number of sheets.
 func (w *WorkBook) NumSheets() int {
 	return len(w.sheets)
 }
 
-//helper function to read all cells from file
-//Notice: the max value is the limit of the max capacity of lines.
-//Warning: the helper function will need big memeory if file is large.
+// ReadAllCells reads the cells of all sheets, at most max rows in total.
+// Each row holds the cell values from column 0; rows without cells are nil.
+// It needs much memory for large files.
 func (w *WorkBook) ReadAllCells(max int) (res [][]string) {
 	res = make([][]string, 0)
-	for _, sheet := range w.sheets {
-		if len(res) < max {
-			max = max - len(res)
-			w.prepareSheet(sheet)
-			if sheet.MaxRow != 0 {
-				leng := int(sheet.MaxRow) + 1
-				if max < leng {
-					leng = max
-				}
-				temp := make([][]string, leng)
-				for k, row := range sheet.rows {
-					data := make([]string, 0)
-					if len(row.cols) > 0 {
-						for _, col := range row.cols {
-							if uint16(len(data)) <= col.LastCol() {
-								data = append(data, make([]string, col.LastCol()-uint16(len(data))+1)...)
-							}
-							str := col.String(w)
-
-							for i := uint16(0); i < col.LastCol()-col.FirstCol()+1; i++ {
-								data[col.FirstCol()+i] = str[i]
-							}
-						}
-						if leng > int(k) {
-							temp[k] = data
-						}
-					}
-				}
-				res = append(res, temp...)
+	for i := range w.sheets {
+		if len(res) >= max {
+			break
+		}
+		s := w.GetSheet(i)
+		if len(s.rows) == 0 {
+			continue
+		}
+		n := min(int(s.MaxRow)+1, max-len(res))
+		temp := make([][]string, n)
+		for k := 0; k < n; k++ {
+			if row := s.rows[uint16(k)]; row != nil && len(row.cols) > 0 {
+				temp[k] = row.values()
 			}
 		}
+		res = append(res, temp...)
 	}
-	return
+	return res
 }
