@@ -20,6 +20,14 @@ const maxSheets = 1024
 // maxCells bounds the cells parsed over all sheets of a workbook (one full sheet).
 const maxCells = 256 * 65536
 
+// parseBudgetFactor and minParseBudget bound the record bytes read over all sheet
+// parses of a workbook: factor times the workbook stream, at least minParseBudget.
+// Sheets that start inside one another would otherwise scan the same bytes again.
+const (
+	parseBudgetFactor = 4
+	minParseBudget    = 1 << 20
+)
+
 // maxCol is the last column BIFF8 allows.
 const maxCol = 255
 
@@ -71,6 +79,9 @@ func (w *WorkSheet) parse(data []byte) error {
 		id, body, ok := rr.next()
 		if !ok {
 			return errors.New("xls: sheet truncated before EOF record")
+		}
+		if w.wb.parseBytes += len(body) + 4; w.wb.parseBytes > max(parseBudgetFactor*len(w.wb.data), minParseBudget) {
+			return errors.New("xls: workbook exceeds the parse budget")
 		}
 		switch id {
 		case recBOF:

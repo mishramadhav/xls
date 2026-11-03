@@ -304,6 +304,46 @@ func TestMalformed(t *testing.T) {
 		}
 	})
 
+	t.Run("overlapping sheet substreams are budgeted", func(t *testing.T) {
+		const sheets = 1000
+		bs := func(pos uint32) []byte { return rec(0x85, u32s(pos), []byte{0, 0, 1, 0}, []byte("S")) }
+		head := bofRec(0x600, 5)
+		base := len(head) + sheets*len(bs(0)) + len(rec(0x0A))
+		var globals, body []byte
+		for range sheets {
+			globals = cat(globals, bs(uint32(base+len(body))))
+			body = cat(body, bofRec(0x600, 0x10))
+			for r := range 100 {
+				body = cat(body, rec(0x208, u16s(uint16(r), 0, 1, 0, 0, 0), u32s(0)))
+			}
+		}
+		stream := cat(head, globals, rec(0x0A), body, bytes.Repeat(rec(0x0A), sheets))
+		file := cfbFile(stream, 512)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		wb, err := OpenReader(bytes.NewReader(file), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wb.ReadAllCells(1 << 20)
+		runtime.ReadMemStats(&after)
+		if n := wb.NumSheets(); n != sheets {
+			t.Fatalf("NumSheets = %d, want %d", n, sheets)
+		}
+		failed := 0
+		for i := 0; i < sheets; i++ {
+			if wb.GetSheet(i).Err() != nil {
+				failed++
+			}
+		}
+		if failed == 0 {
+			t.Error("want a sheet error after the parse budget")
+		}
+		if d := after.TotalAlloc - before.TotalAlloc; d > 16*uint64(len(file)) {
+			t.Errorf("allocated %d bytes for a %d byte file", d, len(file))
+		}
+	})
+
 	t.Run("sheet offset beyond stream", func(t *testing.T) {
 		wb := openRaw(t, xlsFile(nil, labelRec(0, 0, "x"))[:45], 512)
 		if wb.GetSheet(0).Err() == nil {

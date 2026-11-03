@@ -22,6 +22,7 @@ Status: **compliant** (already right), **fixed** (upstream was wrong; the fix ha
 | Files over 256 MiB | not supported | The container is read into memory; larger input is an error. |
 | Sector chains and stream sizes | fixed | A FAT or mini-FAT chain may only use sectors that exist in the file, so its length and the memory reserved for a stream stay below the file size. A declared stream size above its chain is an error. |
 | Cell total | fixed | At most 16,777,216 cells (256 x 65536, `maxCells`) are parsed over all sheets of a workbook, counting each re-parse. The sheet that passes the limit stops with `WorkSheet.Err()` set; cells read before it stay. |
+| Parse budget | fixed | Record bytes (body plus 4-byte header, every record type, nested substreams included) read over all sheet parses are limited to 4 times the workbook stream, at least 1 MiB (`parseBudgetFactor`, `minParseBudget`). Sheets whose substreams overlap cannot multiply the work. The sheet that passes the limit stops with `WorkSheet.Err()` set; cells read before it stay. |
 | Transactions, CLSID, timestamps, red-black colours | not supported | Not needed to read a stream. |
 
 ## [MS-XLS] BIFF8

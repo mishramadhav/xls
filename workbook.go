@@ -23,6 +23,8 @@ type WorkBook struct {
 	sst      []string
 	dateMode uint16
 	cells    int
+	// parseBytes counts record bytes (with headers) read by all sheet parses.
+	parseBytes int
 }
 
 // readStruct fills v from b and reports whether b was long enough.
