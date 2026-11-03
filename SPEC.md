@@ -20,6 +20,8 @@ Status: **compliant** (already right), **fixed** (upstream was wrong; the fix ha
 | Stream size and chain | fixed | A stream whose size exceeds its sector chain is an error. Allocation happens after this check, so it is bounded by the file size. Version 3 uses the low 32 bits of the size only. |
 | Truncated last sector | compliant | Data sectors may be short at the end of the file; FAT, DIFAT and directory sectors must be complete. |
 | Files over 256 MiB | not supported | The container is read into memory; larger input is an error. |
+| Sector chains and stream sizes | fixed | A FAT or mini-FAT chain may only use sectors that exist in the file, so its length and the memory reserved for a stream stay below the file size. A declared stream size above its chain is an error. |
+| Cell total | fixed | At most 16,777,216 cells (256 x 65536, `maxCells`) are parsed over all sheets of a workbook, counting each re-parse. The sheet that passes the limit stops with `WorkSheet.Err()` set; cells read before it stay. |
 | Transactions, CLSID, timestamps, red-black colours | not supported | Not needed to read a stream. |
 
 ## [MS-XLS] BIFF8
@@ -28,7 +30,7 @@ Status: **compliant** (already right), **fixed** (upstream was wrong; the fix ha
 | --- | --- | --- |
 | Record header, size up to 8224 | fixed | A larger or truncated record ends the substream with an error (upstream: allocation from unchecked sizes). |
 | BOF/EOF nesting, substream type | fixed | The workbook must start with a globals BOF. Globals and sheets end at their own EOF; nested substreams (for example charts) are skipped. Upstream parsed the sheets as part of the globals and stopped a sheet at the first nested EOF. |
-| BOUNDSHEET8 | fixed | At most 1024 sheets are kept; later records are ignored (each sheet is parsed again on access). Offset is checked against the stream; the visibility field uses its 2 low bits; the name is a ShortXLUnicodeString. A bad offset sets `WorkSheet.Err()`. |
+| BOUNDSHEET8 | fixed | At most 1024 sheets are kept; later records are ignored (each sheet is parsed again on access). A record whose offset repeats an earlier one, or lies inside the globals substream, is ignored (it would parse the same bytes again). Offset is checked against the stream; the visibility field uses its 2 low bits; the name is a ShortXLUnicodeString. A bad offset sets `WorkSheet.Err()`. |
 | CODEPAGE | fixed | Used for BIFF5 byte strings (cp1250 to cp1258; others fall back to cp1252). Upstream always used cp1251. BIFF8 strings are Unicode. |
 | BIFF5 (`Book` stream) | compliant | Read for LABEL, BOUNDSHEET, FORMAT, FONT. No SST. Tested with a raw file. |
 | SST and CONTINUE | fixed | Character counts continue across records; the fHighByte flag is read again at every split inside character data; rich-text runs and phonetic data are skipped across splits without a flag. A truncated SST, or a truncated CONTINUE after it, is an error. Tests: golden `long_sst` and the raw SST case. |

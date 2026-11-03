@@ -17,6 +17,9 @@ const (
 // maxSheets bounds BOUNDSHEET records: each sheet is parsed again on access.
 const maxSheets = 1024
 
+// maxCells bounds the cells parsed over all sheets of a workbook (one full sheet).
+const maxCells = 256 * 65536
+
 // maxCol is the last column BIFF8 allows.
 const maxCol = 255
 
@@ -81,6 +84,9 @@ func (w *WorkSheet) parse(data []byte) error {
 		}
 		if depth > 1 {
 			continue
+		}
+		if w.wb.cells > maxCells {
+			return errors.New("xls: workbook exceeds the cell limit")
 		}
 		// A string result follows its FORMULA, possibly after array/shared formula records.
 		if id != recString && id != recShrFmla && id != recArray && id != recTable {
@@ -191,6 +197,7 @@ type cell interface {
 }
 
 func (w *WorkSheet) addCell(c cell) {
+	w.wb.cells++
 	if c.FirstCol() > maxCol {
 		return
 	}

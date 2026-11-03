@@ -2,7 +2,9 @@ package xls
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
@@ -221,6 +223,40 @@ func TestMalformed(t *testing.T) {
 		})
 	}
 
+	// ss 4096: one FAT sector holds 1024 entries, so a 1024-sector chain is
+	// declared by a ~100 KB file. FAT sid is at header offset 76.
+	big := func() []byte { return cfbFile(cat(good, make([]byte, 100000)), 4096) }
+	fatEntry := func(b []byte, i int) []byte {
+		return b[(int(binary.LittleEndian.Uint32(b[76:]))+1)*4096+4*i:]
+	}
+	t.Run("FAT chain past the last sector", func(t *testing.T) {
+		b := big()
+		copy(fatEntry(b, 0), u32s(500))
+		copy(fatEntry(b, 500), u32s(eoc))
+		if _, err := OpenReader(bytes.NewReader(b), ""); err == nil {
+			t.Error("want an error")
+		}
+	})
+	t.Run("huge stream size on a long FAT chain", func(t *testing.T) {
+		b := big()
+		for i := 0; i < 1023; i++ {
+			copy(fatEntry(b, i), u32s(uint32(i+1)))
+		}
+		copy(fatEntry(b, 1023), u32s(eoc))
+		dir := (int(binary.LittleEndian.Uint32(b[48:])) + 1) * 4096
+		binary.LittleEndian.PutUint64(b[dir+128+120:], 1024*4096)
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		_, err := OpenReader(bytes.NewReader(b), "")
+		runtime.ReadMemStats(&after)
+		if err == nil {
+			t.Error("want an error")
+		}
+		if d := after.TotalAlloc - before.TotalAlloc; d > 8*uint64(len(b)) {
+			t.Errorf("allocated %d bytes for a %d byte file", d, len(b))
+		}
+	})
+
 	t.Run("ROW after its cells keeps the cells", func(t *testing.T) {
 		wb := openRaw(t, xlsFile(nil, labelRec(0, 0, "a"), labelRec(0, 3, "d"), rec(0x208, u16s(0, 0, 1, 0, 0, 0), u32s(0))), 512)
 		if got := wb.ReadAllCells(10); len(got) != 1 || len(got[0]) != 4 || got[0][3] != "d" {
@@ -231,7 +267,7 @@ func TestMalformed(t *testing.T) {
 	t.Run("sheet count is capped", func(t *testing.T) {
 		var bs []byte
 		for range 3000 {
-			bs = cat(bs, rec(0x85, u32s(0), []byte{0, 0, 1, 0}, []byte("S")))
+			bs = cat(bs, rec(0x85, u32s(uint32(1<<20+len(bs))), []byte{0, 0, 1, 0}, []byte("S")))
 		}
 		wb, err := OpenReader(bytes.NewReader(cfbFile(cat(bofRec(0x600, 5), bs, rec(0x0A)), 512)), "")
 		if err != nil {
@@ -239,6 +275,32 @@ func TestMalformed(t *testing.T) {
 		}
 		if n := wb.NumSheets(); n != maxSheets {
 			t.Errorf("NumSheets = %d, want %d", n, maxSheets)
+		}
+	})
+
+	t.Run("repeated or in-globals sheet offsets are ignored", func(t *testing.T) {
+		head := bofRec(0x600, 5)
+		bs := func(pos uint32) []byte { return rec(0x85, u32s(pos), []byte{0, 0, 1, 0}, []byte("S")) }
+		// 3 records at offset 1<<20, 1 at offset 0 (inside the globals), 1 at the globals' own BOF.
+		stream := cat(head, bs(1<<20), bs(1<<20), bs(1<<20), bs(0), bs(uint32(len(head))), rec(0x0A))
+		wb, err := OpenReader(bytes.NewReader(cfbFile(stream, 512)), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := wb.NumSheets(); n != 1 {
+			t.Errorf("NumSheets = %d, want 1", n)
+		}
+	})
+
+	t.Run("cell total is capped", func(t *testing.T) {
+		blanks := mulBlankRec(0, 0, 256)
+		recs := make([][]byte, maxCells/256+2)
+		for i := range recs {
+			recs[i] = blanks
+		}
+		wb := openRaw(t, xlsFile(nil, recs...), 512)
+		if wb.GetSheet(0).Err() == nil {
+			t.Error("want a sheet error after the cell limit")
 		}
 	})
 

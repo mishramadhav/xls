@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 // WorkBook is an xls workbook.
@@ -21,6 +22,7 @@ type WorkBook struct {
 	data     []byte
 	sst      []string
 	dateMode uint16
+	cells    int
 }
 
 // readStruct fills v from b and reports whether b was long enough.
@@ -51,6 +53,8 @@ func (w *WorkBook) parseGlobals() error {
 			continue
 		case recEOF:
 			if depth--; depth == 0 {
+				// A sheet must start after the globals; earlier offsets re-parse them.
+				w.sheets = slices.DeleteFunc(w.sheets, func(s *WorkSheet) bool { return int(s.bs.Filepos) < rr.pos })
 				return nil
 			}
 			continue
@@ -102,7 +106,11 @@ func (w *WorkBook) addSheet(b []byte) {
 	if len(w.sheets) >= maxSheets {
 		return
 	}
-	bs := &boundsheet{Filepos: le32(b, 0), Visible: b[4] & 3, Type: b[5], Name: b[6]}
+	pos := le32(b, 0)
+	if slices.ContainsFunc(w.sheets, func(s *WorkSheet) bool { return s.bs.Filepos == pos }) {
+		return
+	}
+	bs := &boundsheet{Filepos: pos, Visible: b[4] & 3, Type: b[5], Name: b[6]}
 	name := w.xlString(b[7:], int(b[6]))
 	w.sheets = append(w.sheets, &WorkSheet{bs: bs, Name: name, wb: w, Visibility: TWorkSheetVisibility(bs.Visible)})
 }

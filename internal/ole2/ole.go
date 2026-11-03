@@ -158,14 +158,16 @@ func (o *Ole) readFAT() error {
 	return nil
 }
 
-// chain follows a sector chain, rejecting out-of-range links, free sectors and cycles.
-func chain(start uint32, table []uint32) ([]uint32, error) {
+// chain follows a sector chain, rejecting links to free sectors, to sectors
+// beyond the n that exist, and cycles. It bounds the chain by the real data.
+func chain(start uint32, table []uint32, n int) ([]uint32, error) {
+	n = min(n, len(table))
 	var out []uint32
 	for sid := start; sid != endOfChain; {
-		if sid > maxRegSect || int(sid) >= len(table) {
+		if sid > maxRegSect || int(sid) >= n {
 			return nil, fmt.Errorf("ole2: bad sector id %#x in chain", sid)
 		}
-		if len(out) >= len(table) {
+		if len(out) >= n {
 			return nil, errors.New("ole2: sector chain loops")
 		}
 		out = append(out, sid)
@@ -176,7 +178,7 @@ func chain(start uint32, table []uint32) ([]uint32, error) {
 
 // readRegular reads a FAT-backed stream; size < 0 means the whole chain.
 func (o *Ole) readRegular(start uint32, size int64) ([]byte, error) {
-	sids, err := chain(start, o.fat)
+	sids, err := chain(start, o.fat, (len(o.data)+o.ss-1)/o.ss-1)
 	if err != nil {
 		return nil, err
 	}
@@ -187,7 +189,7 @@ func (o *Ole) readRegular(start uint32, size int64) ([]byte, error) {
 	if size > avail {
 		return nil, errors.New("ole2: stream size exceeds its sector chain")
 	}
-	out := make([]byte, 0, size)
+	out := make([]byte, 0, min(size, int64(len(o.data))))
 	for _, sid := range sids {
 		if int64(len(out)) >= size {
 			break
@@ -228,14 +230,14 @@ func (o *Ole) readMini(start uint32, size int64) ([]byte, error) {
 	if err := o.loadMini(); err != nil {
 		return nil, err
 	}
-	sids, err := chain(start, o.miniFAT)
+	sids, err := chain(start, o.miniFAT, (len(o.miniStream)+miniSectorSize-1)/miniSectorSize)
 	if err != nil {
 		return nil, err
 	}
 	if size > int64(len(sids))*miniSectorSize {
 		return nil, errors.New("ole2: mini stream size exceeds its sector chain")
 	}
-	out := make([]byte, 0, size)
+	out := make([]byte, 0, min(size, int64(len(o.miniStream))))
 	for _, sid := range sids {
 		if int64(len(out)) >= size {
 			break
